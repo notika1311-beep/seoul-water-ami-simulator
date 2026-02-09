@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState, useCallback } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 // --- Types & Interfaces ---
 
@@ -30,7 +30,8 @@ interface MeterState {
   };
 }
 
-interface ModemState {
+// Interface for the UI state (subset of simulation state)
+interface ModemUIState {
   mode: 'SLEEP' | 'WAKE' | 'READ' | 'CONNECT' | 'SEND' | 'WAIT';
   rsrp: number;
   ackFail: boolean;
@@ -42,17 +43,27 @@ interface ModemState {
   retryCount: number;
 }
 
+// Interface for the Mutable Ref State (Full simulation logic state)
+interface ModemSimState {
+  mode: 'SLEEP' | 'WAKE' | 'READ' | 'CONNECT' | 'SEND' | 'WAIT';
+  readPeriod: number;
+  reportPeriod: number;
+  nextRead: number;
+  nextReport: number;
+  buffer: { time: number; val: number; st1: number; st2: number }[];
+  retryCount: number;
+  forceReport: boolean;
+  rsrp: number;
+  ackFail: boolean;
+  delayTimer: number;
+  lastAlarmState: { m: boolean; f: boolean };
+}
+
 // --- Utilities ---
 
 const pad = (n: number | string, w: number, z: string = '0') => {
   n = n + '';
   return n.length >= w ? n : new Array(w - n.length + 1).join(z) + n;
-};
-
-const toHex = (n: number, p: number = 2) => {
-  let hex = n.toString(16).toUpperCase();
-  if (n < 0) hex = (0xFF + n + 1).toString(16).toUpperCase();
-  return hex.padStart(p, '0');
 };
 
 const nowStr = (d: Date) => 
@@ -107,13 +118,15 @@ export default function App() {
     leak: false,
     alarms: { freeze: 0, magnet: 0, overload: 0, backflow: 0 },
   });
-  const modemRef = useRef({
-    mode: 'SLEEP' as const,
+  
+  // Explicitly type the ref to allow mode changes
+  const modemRef = useRef<ModemSimState>({
+    mode: 'SLEEP',
     readPeriod: 3600 * 1000,
     reportPeriod: 6 * 3600 * 1000,
     nextRead: 0,
     nextReport: 0,
-    buffer: [] as any[],
+    buffer: [],
     retryCount: 0,
     forceReport: false,
     rsrp: -90,
@@ -126,7 +139,7 @@ export default function App() {
   const [currentTime, setCurrentTime] = useState<string>("INIT");
   const [speedIdx, setSpeedIdx] = useState(1);
   const [meterUI, setMeterUI] = useState<MeterState>(meterRef.current);
-  const [modemUI, setModemUI] = useState<ModemState>({
+  const [modemUI, setModemUI] = useState<ModemUIState>({
     mode: 'SLEEP', rsrp: -90, ackFail: false, readPeriod: 1, reportPeriod: 6,
     nextRead: 0, nextReport: 0, bufferSize: 0, retryCount: 0
   });
@@ -146,53 +159,6 @@ export default function App() {
     const time = nowStr(clockRef.current.getTime());
     setPacketLogs(prev => [{ id: Date.now() + Math.random(), time, hex }, ...prev].slice(0, 50));
   };
-
-  // --- Initialization ---
-  useEffect(() => {
-    // Align next targets to hour
-    const now = clockRef.current.getTime().getTime();
-    const initT = Math.ceil(now / (3600 * 1000)) * (3600 * 1000);
-    modemRef.current.nextRead = initT;
-    modemRef.current.nextReport = initT + (modemRef.current.reportPeriod - (initT % modemRef.current.reportPeriod));
-    
-    addSysLog("시스템 초기화 완료", "info");
-  }, []);
-
-  // --- Core Simulation Loop ---
-  useEffect(() => {
-    let animationFrameId: number;
-
-    const loop = () => {
-      const deltaVirtualMs = clockRef.current.update();
-      const nowMs = clockRef.current.getTime().getTime();
-
-      if (deltaVirtualMs > 0) {
-        updateMeter(deltaVirtualMs);
-        updateModem(nowMs, deltaVirtualMs);
-      }
-
-      // Sync UI (throttled slightly naturally by React, but here we do every frame for smoothness)
-      // For optimization, one could reduce setStates here.
-      setCurrentTime(nowStr(clockRef.current.getTime()));
-      setMeterUI({ ...meterRef.current }); // Clone to trigger re-render
-      setModemUI({
-        mode: modemRef.current.mode,
-        rsrp: modemRef.current.rsrp,
-        ackFail: modemRef.current.ackFail,
-        readPeriod: modemRef.current.readPeriod / 3600000,
-        reportPeriod: modemRef.current.reportPeriod / 3600000,
-        nextRead: modemRef.current.nextRead,
-        nextReport: modemRef.current.nextReport,
-        bufferSize: modemRef.current.buffer.length,
-        retryCount: modemRef.current.retryCount
-      });
-
-      animationFrameId = requestAnimationFrame(loop);
-    };
-
-    animationFrameId = requestAnimationFrame(loop);
-    return () => cancelAnimationFrame(animationFrameId);
-  }, []); // Run once on mount
 
   // --- Logic Functions (Refs based) ---
 
@@ -214,8 +180,7 @@ export default function App() {
         if (m.alarms[key] < thresholds[key]) {
           m.alarms[key] += dtMs;
           if (m.alarms[key] >= thresholds[key]) {
-            // Triggered just now
-             // We can't easily dedup log here without state, but it's fine for sim
+             addSysLog(`[METER] ${name} 발생! (규격충족)`, "alarm");
           }
         }
       } else {
@@ -420,6 +385,52 @@ export default function App() {
     for (let i = 0; i < str.length; i += 2) arr.push(parseInt(str.substr(i, 2), 16));
   };
 
+  // --- Initialization ---
+  useEffect(() => {
+    // Align next targets to hour
+    const now = clockRef.current.getTime().getTime();
+    const initT = Math.ceil(now / (3600 * 1000)) * (3600 * 1000);
+    modemRef.current.nextRead = initT;
+    modemRef.current.nextReport = initT + (modemRef.current.reportPeriod - (initT % modemRef.current.reportPeriod));
+    
+    addSysLog("시스템 초기화 완료", "info");
+  }, []);
+
+  // --- Core Simulation Loop ---
+  useEffect(() => {
+    let animationFrameId: number;
+
+    const loop = () => {
+      const deltaVirtualMs = clockRef.current.update();
+      const nowMs = clockRef.current.getTime().getTime();
+
+      if (deltaVirtualMs > 0) {
+        updateMeter(deltaVirtualMs);
+        updateModem(nowMs, deltaVirtualMs);
+      }
+
+      // Sync UI
+      setCurrentTime(nowStr(clockRef.current.getTime()));
+      setMeterUI({ ...meterRef.current }); 
+      setModemUI({
+        mode: modemRef.current.mode,
+        rsrp: modemRef.current.rsrp,
+        ackFail: modemRef.current.ackFail,
+        readPeriod: modemRef.current.readPeriod / 3600000,
+        reportPeriod: modemRef.current.reportPeriod / 3600000,
+        nextRead: modemRef.current.nextRead,
+        nextReport: modemRef.current.nextReport,
+        bufferSize: modemRef.current.buffer.length,
+        retryCount: modemRef.current.retryCount
+      });
+
+      animationFrameId = requestAnimationFrame(loop);
+    };
+
+    animationFrameId = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(animationFrameId);
+  }, []);
+
   // --- Handlers ---
 
   const handleSpeedChange = (val: string) => {
@@ -429,8 +440,6 @@ export default function App() {
   };
 
   const handleEnvChange = (key: keyof MeterState, val: any) => {
-    // React state update for UI
-    // Ref update for Physics loop
     if (key === 'flow') meterRef.current.flow = parseInt(val);
     if (key === 'temp') meterRef.current.temp = parseInt(val);
     if (key === 'volt') meterRef.current.volt = parseFloat(val);
@@ -451,7 +460,6 @@ export default function App() {
     modemRef.current.readPeriod = read * 3600000;
     modemRef.current.reportPeriod = report * 3600000;
     
-    // Re-align
     const now = clockRef.current.getTime().getTime();
     modemRef.current.nextRead = now + (modemRef.current.readPeriod - (now % modemRef.current.readPeriod));
     modemRef.current.nextReport = now + (modemRef.current.reportPeriod - (now % modemRef.current.reportPeriod));
@@ -680,7 +688,6 @@ export default function App() {
           <div className="w-full max-w-2xl flex items-center mb-16 relative">
             <div className="w-12 h-7 bg-slate-300 rounded-l flex items-center justify-center text-[9px] text-slate-500">In</div>
             <div className="flex-1 pipe-container bg-slate-300 relative overflow-hidden h-6 rounded-none">
-               {/* Simplified Water Animation using CSS classes derived from flow state */}
                {meterUI.flow !== 0 && (
                  <div className={`absolute inset-0 opacity-60 bg-blue-400 ${meterUI.flow > 0 ? 'animate-[flow-fwd_1s_linear_infinite]' : 'animate-[flow-bwd_1s_linear_infinite]'}`} 
                       style={{ background: meterUI.flow > 0 ? 
